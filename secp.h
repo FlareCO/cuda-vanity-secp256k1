@@ -292,6 +292,59 @@ HD static inline void scalar_sub_u64(scalar* r, const scalar* a, uint64_t v){
     for (int i=1;i<4;i++){ u128 c=(u128)a->d[i]-br; r->d[i]=(uint64_t)c; br=(uint64_t)((c>>64)&1); }
 }
 
+/* ---------------------------------------------------------------------------
+ * secp256k1 group order n and the GLV endomorphism (for vanity acceleration).
+ *
+ *   [lambda] * (x, y) == (beta * x, y)   over the curve, with
+ *   lambda^3 == 1 (mod n)   and   beta^3 == 1 (mod p).
+ *
+ * This lets one computed point (x, y) yield THREE distinct public keys for the
+ * price of two field multiplies:  (x,y), (beta*x,y), (beta^2*x,y), corresponding
+ * to private keys s, lambda*s, lambda^2*s.  Combined with y-negation (which
+ * flips the compressed-pubkey parity byte and maps s -> n-s) that is up to SIX
+ * candidate addresses per point.  Recovery on a hit: key = (-1)^neg * lambda^e * s.
+ *
+ * The scn_* helpers are constant-light modular arithmetic mod n; they are only
+ * needed on the host (hit recovery) and in the GPU self-test, never in the hot
+ * search loop, so the simple double-and-add multiply is fine.
+ * ------------------------------------------------------------------------- */
+HD static inline void secp_n(scalar* r){
+    r->d[0]=0xBFD25E8CD0364141ULL; r->d[1]=0xBAAEDCE6AF48A03BULL;
+    r->d[2]=0xFFFFFFFFFFFFFFFEULL; r->d[3]=0xFFFFFFFFFFFFFFFFULL;
+}
+HD static inline void secp_beta(fe* r){   /* beta in F_p */
+    r->d[0]=0xc1396c28719501eeULL; r->d[1]=0x9cf0497512f58995ULL;
+    r->d[2]=0x6e64479eac3434e9ULL; r->d[3]=0x7ae96a2b657c0710ULL;
+}
+HD static inline void secp_lambda(scalar* r){ /* lambda in Z_n; [lambda]P = (beta*x, y) */
+    r->d[0]=0xdf02967c1b23bd72ULL; r->d[1]=0x122e22ea20816678ULL;
+    r->d[2]=0xa5261c028812645aULL; r->d[3]=0x5363ad4cc05c30e0ULL;
+}
+HD static inline int scn_ge(const scalar* a, const scalar* b){
+    for (int i=3;i>=0;i--){ if(a->d[i]>b->d[i])return 1; if(a->d[i]<b->d[i])return 0; } return 1;
+}
+HD static inline void scn_sub_raw(scalar* r, const scalar* a, const scalar* b){
+    u128 br=0; for (int i=0;i<4;i++){ u128 c=(u128)a->d[i]-b->d[i]-br; r->d[i]=(uint64_t)c; br=(c>>64)&1; }
+}
+HD static inline void scn_add(scalar* r, const scalar* a, const scalar* b){ /* (a+b) mod n, a,b < n */
+    scalar n; secp_n(&n);
+    uint64_t t[4]; u128 cy=0;
+    for (int i=0;i<4;i++){ u128 s=(u128)a->d[i]+b->d[i]+cy; t[i]=(uint64_t)s; cy=s>>64; }
+    scalar tmp; tmp.d[0]=t[0]; tmp.d[1]=t[1]; tmp.d[2]=t[2]; tmp.d[3]=t[3];
+    if (cy || scn_ge(&tmp,&n)) scn_sub_raw(&tmp,&tmp,&n); /* a+b < 2n, so one subtract suffices */
+    *r=tmp;
+}
+HD static inline void scn_mul(scalar* r, const scalar* a, const scalar* b){ /* (a*b) mod n, a,b < n */
+    scalar res; res.d[0]=res.d[1]=res.d[2]=res.d[3]=0;
+    for (int i=255;i>=0;i--){
+        scn_add(&res,&res,&res);
+        uint64_t bit=(b->d[i>>6] >> (i & 63)) & 1ULL;
+        if (bit) scn_add(&res,&res,a);
+    }
+    *r=res;
+}
+HD static inline void scn_neg(scalar* r, const scalar* a){ scalar n; secp_n(&n); scn_sub_raw(r,&n,a); } /* 0<a<n */
+
 HD static inline uint32_t rotr32(uint32_t x, int n){ return (x>>n)|(x<<(32-n)); }
 
 HD static inline void sha256(const uint8_t* msg, int len, uint8_t out[32]){

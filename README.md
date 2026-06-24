@@ -21,7 +21,10 @@ whole pipeline is validated **bit-for-bit against libsecp256k1** (via
 
 Throughput comes from a precomputed `i·G` table + Montgomery batch inversion
 (one modular inverse per window), a **±symmetry** walk (each inverse yields two
-points, `center±i·G`), and register-resident single-block SHA-256/RIPEMD-160.
+points, `center±i·G`), register-resident single-block SHA-256/RIPEMD-160, and the
+**GLV endomorphism** — each computed point is tested as up to **six** addresses
+(`x`, `βx`, `β²x`, each with both y-parities) for the cost of two field multiplies,
+multiplying the addresses checked per unit of curve arithmetic.
 
 ## Requirements
 
@@ -50,7 +53,8 @@ The source is identical across cards — only the `ARCH` flag changes.
 ## Usage
 
 Search for a bech32 prefix (characters after `bc1q` must be in the bech32
-charset `qpzry9x8gf2tvdw0s3jn54khce6mua7l`):
+charset `qpzry9x8gf2tvdw0s3jn54khce6mua7l`). Up to **32 characters** after `bc1q`
+(160 bits — the full hash160) are supported:
 
 ```bash
 ./vanity_gpu --search bc1qcafe --blocks 2048 --windows 16
@@ -76,6 +80,30 @@ Re-derive everything from a private key with the CPU oracle:
 Flags: `--blocks N` (thread blocks), `--windows N` (windows per launch),
 `--maxsec S` (stop after S seconds with no hit).
 
+### Tuning knobs (compile-time)
+
+The candidate-per-point fan-out is controlled by two macros so you can find the
+sweet spot for your card (more candidates = more addresses per point, but more
+hashing and register pressure):
+
+```bash
+make gpu ARCH=sm_86                              # default: 6 candidates/point (endo + parity)
+make gpu ARCH=sm_86 NVCCFLAGS="-O3 -arch=sm_86 -std=c++14 --expt-relaxed-constexpr -DUSE_ENDO=0"   # 2/point (parity only)
+make gpu ARCH=sm_86 NVCCFLAGS="-O3 -arch=sm_86 -std=c++14 --expt-relaxed-constexpr -DUSE_ENDO=0 -DUSE_PARITY=0"  # 1/point (original)
+```
+
+| `USE_ENDO` | `USE_PARITY` | candidates / point | notes |
+|-----------|--------------|--------------------|-------|
+| 1 | 1 | 6 | default (GLV β,β² × both parities) |
+| 1 | 0 | 3 | GLV images, single parity |
+| 0 | 1 | 2 | y-symmetry only, no GLV muls |
+| 0 | 0 | 1 | original behaviour |
+
+`W` (window/group size) is also a compile knob (`-DWSIZE=N`, default 768). If the
+6-candidate kernel is register/occupancy-bound, try a smaller `W` together with
+the full fan-out, or dial the fan-out down. Sweep `--blocks` / `--windows` at
+runtime as before.
+
 ## How it works
 
 - One CSPRNG base scalar `k0` is drawn on the host.
@@ -85,11 +113,19 @@ Flags: `--blocks N` (thread blocks), `--windows N` (windows per launch),
   window is built from a constant-memory table `i·G`.
 - **±symmetry:** `center+i·G` and `center−i·G` share the same denominator, so
   one batch inverse (Montgomery trick) serves two points.
-- Each point is hashed to a hash160 and its leading bits compared to the target
-  derived from the requested bech32 prefix.
-- Hits store `(thread, window, signed step)`; the host reconstructs the private
-  scalar, recomputes the address, and **rejects any hit that does not
-  reproduce** before printing.
+- **GLV endomorphism:** for each computed affine point `(x, y)`, the curve map
+  `[λ](x,y) = (βx, y)` gives two more valid public keys (`βx`, `β²x`) for the
+  cost of two field multiplies, and negating `y` (flip the compressed-pubkey
+  parity byte, `s → n−s`) doubles that again — up to **6 candidate addresses per
+  point**. Each candidate corresponds to a recoverable private key
+  `(−1)^neg · λ^e · s (mod n)`.
+- Each candidate is hashed to a hash160 and its leading bits compared to the
+  target derived from the requested bech32 prefix (up to 160 bits / 32 chars,
+  matched across three 64-bit words; short prefixes short-circuit on the first).
+- Hits store `(thread, window, signed step, variant)`; the host reconstructs the
+  base scalar, applies the variant transform to get the real private key,
+  recomputes the address, and **rejects any hit that does not reproduce** before
+  printing.
 
 ## Correctness
 
@@ -105,12 +141,19 @@ The implementation is validated by five gates (see `BENCH.md`):
 5. **bech32** — charset and checksum match an independent encoder and the
    canonical BIP-173 vector (`priv=1 → bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4`).
 
+6. **GLV endomorphism** — for thousands of scalars and all six variants, the
+   address built from `(β^e·x, ±y)` equals the address derived from the recovered
+   key `(−1)^neg·λ^e·s`. Checked on the host (`--endotest`, no GPU needed) and on
+   the device (`--gpuendocheck`).
+
 Run the checks yourself:
 
 ```bash
+./vanity --endotest 5000                             # gate 6, host (GLV math + key recovery)
 python3 verify.py ./vanity 500                       # CPU oracle vs coincurve
 ./vanity_gpu --gpufieldtest 2000                     # gate 1
 ./vanity_gpu --gpuwalkcheck 8192                      # gate 2
+./vanity_gpu --gpuendocheck 8192                      # gate 6, device (GLV path on GPU)
 ./vanity_gpu --gpuderive 2000 | python3 gpucheck.py --gen   # gate 4
 ```
 

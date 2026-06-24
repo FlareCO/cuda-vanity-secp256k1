@@ -23,19 +23,50 @@
 
 __constant__ affine c_Gt[W];
 __constant__ affine c_Sstride;
-__constant__ uint64_t c_target;
-__constant__ uint64_t c_mask;
+__constant__ fe       c_beta;               // GLV endomorphism constant (beta in F_p)
+#define TARGW 3                              // up to 160-bit (32-char) prefix targets
+__constant__ uint64_t c_target[TARGW];
+__constant__ uint64_t c_mask[TARGW];
 
-struct Hit { uint32_t tid, widx; int32_t step; uint8_t h160[20]; };
+// ---- variant knobs (compile-time, for benchmarking / bisecting on real HW) ----
+//   USE_ENDO=1   -> also test (beta*x, y) and (beta^2*x, y)   (GLV, +2 muls, x2 hashes)
+//   USE_PARITY=1 -> also test the y-negation of each x         (+0 muls, x2 hashes)
+//   default 6 candidates/point; set either to 0 to shrink if register/hash-bound.
+#ifndef USE_ENDO
+#define USE_ENDO 1
+#endif
+#ifndef USE_PARITY
+#define USE_PARITY 1
+#endif
+#if USE_ENDO
+#define NENDO 3
+#else
+#define NENDO 1
+#endif
+#if USE_PARITY
+#define NSIGN 2
+#else
+#define NSIGN 1
+#endif
+
+struct Hit { uint32_t tid, widx; int32_t step; uint8_t variant; uint8_t h160[20]; };
 #define MAXHITS 4096
 __device__ Hit  d_hits[MAXHITS];
 __device__ unsigned int d_hitcount;
 
-__device__ __forceinline__ uint64_t h160_top64(const uint8_t h[20]){
-    uint64_t v=0;
+__device__ __forceinline__ int h160_match(const uint8_t h[20]){
+    uint64_t w0=0,w1=0,w2=0;
     #pragma unroll
-    for (int i=0;i<8;i++) v=(v<<8)|h[i];
-    return v;
+    for (int i=0;i<8;i++)  w0=(w0<<8)|h[i];
+    #pragma unroll
+    for (int i=8;i<16;i++) w1=(w1<<8)|h[i];
+    #pragma unroll
+    for (int i=16;i<20;i++)w2=(w2<<8)|h[i];
+    w2<<=32;
+    if ((w0 & c_mask[0]) != c_target[0]) return 0;   // short prefixes: mask1=mask2=0 -> trivially pass
+    if ((w1 & c_mask[1]) != c_target[1]) return 0;
+    if ((w2 & c_mask[2]) != c_target[2]) return 0;
+    return 1;
 }
 
 struct FieldIn  { fe a, b; uint64_t t[8]; };
@@ -106,22 +137,78 @@ __global__ void k_derive(const scalar* ks, uint8_t* h160out, int n){
     for (int k=0;k<20;k++) h160out[i*20+k]=h[k];
 }
 
-__device__ __forceinline__ void check_point(const affine* Q, uint32_t t, uint32_t w, int32_t step){
-#ifdef NOHASH
-
-    uint8_t h[20]; for(int k=0;k<20;k++) h[k]=(uint8_t)(Q->x.d[k%4]>>(8*(k%8)));
-    uint64_t top=Q->x.d[3];
-#else
-    uint8_t h[20]; pubkey_hash160(h,Q);
-    uint64_t top=h160_top64(h);
-#endif
-    if ((top & c_mask) == (c_target & c_mask)){
-        unsigned int slot=atomicAdd(&d_hitcount,1u);
-        if (slot<MAXHITS){
-            d_hits[slot].tid=t; d_hits[slot].widx=w; d_hits[slot].step=step;
-            for (int k=0;k<20;k++) d_hits[slot].h160[k]=h[k];
+// Self-test for the GLV path: for N consecutive scalars and all 6 variants, the
+// candidate hash built from (beta^e * x, sign*y) must equal the hash of the point
+// derived from the recovered key (-1)^neg * lambda^e * s. Any mismatch -> count.
+__global__ void k_endocheck(scalar k0, long N, unsigned long long* mism){
+    if (blockIdx.x*blockDim.x+threadIdx.x != 0) return;
+    *mism=0;
+    scalar lambda; secp_lambda(&lambda);
+    for (long it=0; it<N; it++){
+        scalar s; scalar_add_u64(&s,&k0,(uint64_t)it);
+        affine P; scalar_mul_G(&P,&s);
+        uint8_t par=(uint8_t)fe_is_odd(&P.y);
+        fe xs[3]; xs[0]=P.x; fe_mul(&xs[1],&P.x,&c_beta); fe_mul(&xs[2],&xs[1],&c_beta);
+        for (int e=0;e<3;e++) for (int neg=0;neg<2;neg++){
+            uint8_t pk[33]; pk[0]=0x02 | (par ^ (uint8_t)neg); fe_get_b32(pk+1,&xs[e]);
+            uint32_t sh[8]; sha256_33(pk,sh); uint8_t hc[20]; ripemd160_32(sh,hc);
+            scalar key=s; for(int q=0;q<e;q++) scn_mul(&key,&key,&lambda); if(neg) scn_neg(&key,&key);
+            affine R; scalar_mul_G(&R,&key); uint8_t hr[20]; pubkey_hash160(hr,&R);
+            int ok=1; for(int k=0;k<20;k++) if(hc[k]!=hr[k]) ok=0;
+            if(!ok) atomicAdd(mism,1ULL);
         }
     }
+}
+
+__device__ __forceinline__ void store_hit(uint32_t t, uint32_t w, int32_t step,
+                                          uint8_t variant, const uint8_t h[20]){
+    unsigned int slot=atomicAdd(&d_hitcount,1u);
+    if (slot<MAXHITS){
+        d_hits[slot].tid=t; d_hits[slot].widx=w; d_hits[slot].step=step; d_hits[slot].variant=variant;
+        #pragma unroll
+        for (int k=0;k<20;k++) d_hits[slot].h160[k]=h[k];
+    }
+}
+
+// Test up to NENDO*NSIGN candidate addresses derived from a single point Q:
+//   endomorphism images   x, beta*x, beta^2*x         (private keys s, lam*s, lam^2*s)
+//   y-negation per image  flips the parity byte         (private key -> n - key)
+// On a hit, the (endo,sign) index is packed into the variant byte so the host can
+// recover the exact private key and re-verify before printing.
+__device__ __forceinline__ void check_point(const affine* Q, uint32_t t, uint32_t w, int32_t step){
+    fe xs[NENDO];
+    xs[0]=Q->x;
+#if NENDO>1
+    fe_mul(&xs[1],&Q->x,&c_beta);
+#endif
+#if NENDO>2
+    fe_mul(&xs[2],&xs[1],&c_beta);
+#endif
+#ifdef NOHASH
+    // field-only benchmark path: do the endomorphism muls but skip hashing
+    if ((xs[NENDO-1].d[3] & c_mask[0]) == c_target[0]){
+        uint8_t z[20];
+        #pragma unroll
+        for (int k=0;k<20;k++) z[k]=0;
+        store_hit(t,w,step,0,z);
+    }
+#else
+    uint8_t par=(uint8_t)fe_is_odd(&Q->y);
+    // outer loop NOT force-unrolled: inlining the hash NENDO times spikes register
+    // pressure and hurts occupancy (pp[W] already pins a lot of local memory).
+    // The inner sign loop IS unrolled — both parities reuse the same serialized pk[1..32].
+    for (int e=0;e<NENDO;e++){
+        uint8_t pk[33];
+        fe_get_b32(pk+1,&xs[e]);
+        #pragma unroll
+        for (int neg=0;neg<NSIGN;neg++){
+            pk[0]=0x02 | (par ^ (uint8_t)neg);
+            uint32_t sh[8]; sha256_33(pk,sh);
+            uint8_t h[20];  ripemd160_32(sh,h);
+            if (h160_match(h)) store_hit(t,w,step,(uint8_t)(e*2+neg),h);
+        }
+    }
+#endif
 }
 
 __global__ void __launch_bounds__(TPB) k_search(scalar k0, uint32_t nThreads, uint32_t windows){
@@ -185,6 +272,9 @@ static void upload_tables(uint32_t nThreads){
     for (int i=2;i<W;i++) affine_add(&Gt[i],&Gt[i-1],&G);
     CK(cudaMemcpyToSymbol(c_Gt,Gt,sizeof(affine)*W));
     free(Gt);
+
+    fe beta; secp_beta(&beta);
+    CK(cudaMemcpyToSymbol(c_beta,&beta,sizeof(fe)));
 
     uint64_t span=2ULL*(W-1)+1;
     uint64_t stride=(uint64_t)nThreads*span;
@@ -253,6 +343,18 @@ static int gpu_walkcheck(long N){
     return m==0?0:1;
 }
 
+static int gpu_endocheck(long N){
+    upload_tables(1);
+    scalar k0; k0.d[0]=0x0badf00dcafe0099ULL;k0.d[1]=0x0fedcba987654321ULL;k0.d[2]=0xdeadbeefcafebabeULL;k0.d[3]=0x0000000000000042ULL;
+    unsigned long long* dm; CK(cudaMalloc(&dm,sizeof(unsigned long long)));
+    k_endocheck<<<1,1>>>(k0,N,dm);
+    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+    unsigned long long m; CK(cudaMemcpy(&m,dm,sizeof(m),cudaMemcpyDeviceToHost));
+    printf("gpuendocheck N=%ld variants=6 mismatches=%llu %s\n",N,m,m==0?"PASS":"FAIL");
+    cudaFree(dm);
+    return m==0?0:1;
+}
+
 static int gpu_derive(int n, uint64_t seed){
     std::mt19937_64 rng(seed);
     scalar* hk=(scalar*)malloc(sizeof(scalar)*n);
@@ -274,25 +376,30 @@ static int gpu_derive(int n, uint64_t seed){
     return 0;
 }
 
-static int prefix_to_target(const char* chars, uint64_t* target, uint64_t* mask, int* nbits){
+// Pack the requested bech32 prefix (chars after "bc1q") into the leading bits of
+// hash160, MSB-first, across TARGW 64-bit words. Up to 32 chars (5*32 = 160 bits).
+static int prefix_to_target(const char* chars, uint64_t target[TARGW], uint64_t mask[TARGW], int* nbits){
     int m=(int)strlen(chars);
     int bits=5*m;
-    if (bits>64){ fprintf(stderr,"prefix too long (max 12 chars after bc1q)\n"); return -1; }
-    uint64_t val=0;
+    if (bits>160){ fprintf(stderr,"prefix too long (max 32 chars after bc1q)\n"); return -1; }
+    for (int k=0;k<TARGW;k++){ target[k]=0; mask[k]=0; }
     for (int i=0;i<m;i++){
         const char* pos=strchr(BECH32_CHARSET,chars[i]);
         if (!pos){ fprintf(stderr,"char '%c' not in bech32 charset\n",chars[i]); return -1; }
-        val=(val<<5)|(uint64_t)(pos-BECH32_CHARSET);
+        uint64_t v=(uint64_t)(pos-BECH32_CHARSET);   // 0..31
+        for (int j=0;j<5;j++){
+            int b=5*i+j;                              // bit index from MSB of word 0
+            int word=b/64, sh=63-(b%64);
+            target[word] |= ((v>>(4-j))&1ULL) << sh;
+            mask[word]   |= 1ULL << sh;
+        }
     }
-
-    *target = (bits==0)?0: (val << (64-bits));
-    *mask   = (bits>=64)?~0ULL: (~0ULL << (64-bits));
     *nbits=bits;
     return 0;
 }
 
 static int verify_and_print_hit(const scalar* launch_k0, uint32_t nThreads,
-                                const Hit* h, uint64_t target, uint64_t mask,
+                                const Hit* h, const uint64_t target[TARGW], const uint64_t mask[TARGW],
                                 const char* want_prefix){
 
     const uint64_t M=W-1, span=2ULL*M+1;
@@ -300,13 +407,25 @@ static int verify_and_print_hit(const scalar* launch_k0, uint32_t nThreads,
     uint64_t lo=(uint64_t)off, hi=(uint64_t)(off>>64);
     scalar s; scalar_add_u128(&s,launch_k0,lo,hi);
     scalar_reduce_n(&s);
-    uint8_t priv[32]; scalar_to_b32(priv,&s);
-    affine P; scalar_mul_G(&P,&s);
+
+    // recover the actual private key for this candidate:  key = (-1)^neg * lambda^e * s (mod n)
+    int e=h->variant>>1, neg=h->variant&1;
+    scalar lambda; secp_lambda(&lambda);
+    scalar key=s;
+    for (int q=0;q<e;q++) scn_mul(&key,&key,&lambda);
+    if (neg) scn_neg(&key,&key);
+
+    uint8_t priv[32]; scalar_to_b32(priv,&key);
+    affine P; scalar_mul_G(&P,&key);
     uint8_t h160[20]; pubkey_hash160(h160,&P);
 
     int hmatch=1; for(int k=0;k<20;k++) if(h160[k]!=h->h160[k]) hmatch=0;
-    uint64_t top=0; for(int i=0;i<8;i++) top=(top<<8)|h160[i];
-    int pmatch=((top&mask)==(target&mask));
+    uint64_t w0=0,w1=0,w2=0;
+    for(int i=0;i<8;i++)   w0=(w0<<8)|h160[i];
+    for(int i=8;i<16;i++)  w1=(w1<<8)|h160[i];
+    for(int i=16;i<20;i++) w2=(w2<<8)|h160[i];
+    w2<<=32;
+    int pmatch=((w0&mask[0])==target[0])&&((w1&mask[1])==target[1])&&((w2&mask[2])==target[2]);
     std::string a_w=p2wpkh_address(h160), a_p=p2pkh_address(h160), w=wif_compressed(priv);
     char hpriv[65],hhex[41]; tohex(priv,32,hpriv); tohex(h160,20,hhex);
     int ok = hmatch && pmatch && a_w.compare(0,strlen(want_prefix),want_prefix)==0;
@@ -326,10 +445,10 @@ static int verify_and_print_hit(const scalar* launch_k0, uint32_t nThreads,
 static int gpu_search(const char* full_prefix, int blocks, uint32_t windows, double maxsec){
     if (strncmp(full_prefix,"bc1q",4)!=0){ fprintf(stderr,"prefix must start with bc1q\n"); return 2; }
     const char* chars=full_prefix+4;
-    uint64_t target,mask; int nbits;
-    if (prefix_to_target(chars,&target,&mask,&nbits)!=0) return 2;
-    CK(cudaMemcpyToSymbol(c_target,&target,sizeof(target)));
-    CK(cudaMemcpyToSymbol(c_mask,&mask,sizeof(mask)));
+    uint64_t target[TARGW],mask[TARGW]; int nbits;
+    if (prefix_to_target(chars,target,mask,&nbits)!=0) return 2;
+    CK(cudaMemcpyToSymbol(c_target,target,sizeof(uint64_t)*TARGW));
+    CK(cudaMemcpyToSymbol(c_mask,mask,sizeof(uint64_t)*TARGW));
     uint32_t nThreads=(uint32_t)blocks*TPB;
     upload_tables(nThreads);
 
@@ -346,9 +465,13 @@ static int gpu_search(const char* full_prefix, int blocks, uint32_t windows, dou
         k_search<<<blocks,TPB>>>(k0,nThreads,windows);
         CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         uint64_t span=2ULL*(W-1)+1;
-        total_keys += (double)nThreads*span*windows;
+        // each base point tests NENDO*NSIGN candidate addresses (point->pubkey->sha->ripemd->test),
+        // so the address-throughput is that many times the base-point count.
+        total_keys += (double)nThreads*span*windows*(NENDO*NSIGN);
         launch++;
 
+        // k0 only advances over the contiguous base-point scalar space; the GLV
+        // candidates live at lambda-multiples, not in this contiguous range.
         uint64_t adv=(uint64_t)nThreads*span*windows;
         scalar nk; scalar_add_u128(&nk,&k0,adv,0); k0=nk;
 
@@ -382,6 +505,9 @@ int main(int argc, char** argv){
     if (argc>=2 && strcmp(argv[1],"--gpuwalkcheck")==0){
         long N=argc>=3?atol(argv[2]):4096; return gpu_walkcheck(N);
     }
+    if (argc>=2 && strcmp(argv[1],"--gpuendocheck")==0){
+        long N=argc>=3?atol(argv[2]):4096; return gpu_endocheck(N);
+    }
     if (argc>=2 && strcmp(argv[1],"--gpuderive")==0){
         int n=argc>=3?atoi(argv[2]):512; uint64_t seed=argc>=4?strtoull(argv[3],0,10):42; return gpu_derive(n,seed);
     }
@@ -394,6 +520,6 @@ int main(int argc, char** argv){
         }
         return gpu_search(argv[2],blocks,windows,maxsec);
     }
-    fprintf(stderr,"usage: %s --gpufieldtest [n] | --gpuwalkcheck N | --gpuderive N [seed] | --search bc1q<prefix> [--blocks B --windows W --maxsec S]\n",argv[0]);
+    fprintf(stderr,"usage: %s --gpufieldtest [n] | --gpuwalkcheck N | --gpuendocheck N | --gpuderive N [seed] | --search bc1q<prefix> [--blocks B --windows W --maxsec S]\n",argv[0]);
     return 2;
 }

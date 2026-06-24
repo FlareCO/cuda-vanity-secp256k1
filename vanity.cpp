@@ -134,6 +134,43 @@ static int gentest(long N, uint64_t seed){
     return 0;
 }
 
+// Validates the GLV endomorphism, y-symmetry, and the exact private-key recovery
+// the GPU path relies on, using only secp.h's own (coincurve-validated) curve math
+// as ground truth. No GPU required.
+static int endotest(long N){
+    fe beta; secp_beta(&beta);
+    scalar lambda; secp_lambda(&lambda);
+    std::mt19937_64 rng(0xE5D0);
+    long fail=0;
+    for (long it=0; it<N; it++){
+        scalar s; for(int k=0;k<4;k++) s.d[k]=rng(); s.d[3]&=0x7FFFFFFFFFFFFFFFULL;
+        if((s.d[0]|s.d[1]|s.d[2]|s.d[3])==0) s.d[0]=1;
+        affine P; scalar_mul_G(&P,&s);
+
+        // (beta*x, y) == (lambda*s)*G  and  (beta^2*x, y) == (lambda^2*s)*G
+        fe bx; fe_mul(&bx,&P.x,&beta);
+        fe b2x; fe_mul(&b2x,&bx,&beta);
+        scalar ls; scn_mul(&ls,&lambda,&s);
+        scalar l2; scn_mul(&l2,&lambda,&lambda); scalar l2s; scn_mul(&l2s,&l2,&s);
+        affine Pl,Pl2; scalar_mul_G(&Pl,&ls); scalar_mul_G(&Pl2,&l2s);
+        if(!(fe_eq(&bx,&Pl.x)&&fe_eq(&P.y,&Pl.y)))    fail++;
+        if(!(fe_eq(&b2x,&Pl2.x)&&fe_eq(&P.y,&Pl2.y)))  fail++;
+
+        // full 6-variant recovery round-trip: candidate pubkey must equal pubkey(recovered key)
+        for(int e=0;e<3;e++) for(int neg=0;neg<2;neg++){
+            fe cx=P.x; for(int q=0;q<e;q++){ fe t; fe_mul(&t,&cx,&beta); cx=t; }
+            uint8_t par=(uint8_t)fe_is_odd(&P.y);
+            uint8_t cpk[33]; cpk[0]=0x02|(par^(uint8_t)neg); fe_get_b32(cpk+1,&cx);
+            scalar key=s; for(int q=0;q<e;q++) scn_mul(&key,&key,&lambda); if(neg) scn_neg(&key,&key);
+            affine R; scalar_mul_G(&R,&key);
+            uint8_t rpk[33]; rpk[0]=fe_is_odd(&R.y)?0x03:0x02; fe_get_b32(rpk+1,&R.x);
+            if(memcmp(cpk,rpk,33)!=0) fail++;
+        }
+    }
+    printf("endotest N=%ld mismatches=%ld %s\n", N, fail, fail==0?"PASS":"FAIL");
+    return fail==0?0:1;
+}
+
 static int cpu_search(const char* prefix){
     std::random_device rd; std::mt19937_64 rng(((uint64_t)rd()<<32)^rd());
     uint8_t priv[32];
@@ -167,11 +204,14 @@ int main(int argc, char** argv){
         long N=argc>=3?atol(argv[2]):1000; return walkcheck(N);
     }
     if (argc>=2 && strcmp(argv[1],"--selftest")==0) return selftest();
+    if (argc>=2 && strcmp(argv[1],"--endotest")==0){
+        long N=argc>=3?atol(argv[2]):1000; return endotest(N);
+    }
     if (argc>=2 && strcmp(argv[1],"--gentest")==0){
         long N=argc>=3?atol(argv[2]):100; uint64_t seed=argc>=4?strtoull(argv[3],0,10):12345;
         return gentest(N,seed);
     }
     if (argc>=2 && strcmp(argv[1],"--search")==0 && argc>=3) return cpu_search(argv[2]);
-    fprintf(stderr,"usage: %s --dump <hex> | --walkcheck N | --selftest | --gentest N seed | --search <prefix>\n", argv[0]);
+    fprintf(stderr,"usage: %s --dump <hex> | --walkcheck N | --selftest | --endotest N | --gentest N seed | --search <prefix>\n", argv[0]);
     return 2;
 }
