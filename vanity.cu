@@ -452,6 +452,10 @@ static int gpu_search(const char* full_prefix, int blocks, uint32_t windows, dou
     uint32_t nThreads=(uint32_t)blocks*TPB;
     upload_tables(nThreads);
 
+    // k_search is local-memory-heavy (pp[W]) and uses no shared memory, so bias the
+    // SM carveout fully toward L1 to better cache the prefix-product spills.
+    cudaFuncSetAttribute(k_search, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxL1);
+
     scalar k0=random_scalar();
     uint8_t k0b[32]; scalar_to_b32(k0b,&k0); char k0hex[65]; tohex(k0b,32,k0hex);
     printf("search prefix=%s nbits=%d threads=%u W=%d windows/launch=%u k0=%s\n",
